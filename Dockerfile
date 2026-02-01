@@ -17,12 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavfilter-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Установка uv (быстрый пакетный менеджер с параллельной загрузкой)
-RUN pip install uv
-
-# Копирование и установка Python зависимостей (параллельно)
+# Копирование и установка Python зависимостей
 COPY requirements.txt .
-RUN uv pip install --system --no-cache -r requirements.txt
+RUN pip install --no-cache-dir --timeout=600 -r requirements.txt
 
 # Предзагрузка модели Whisper (small) при сборке
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"

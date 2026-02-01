@@ -1,5 +1,5 @@
 aiogram==3.4.1
-av==10.0.0
+av>=12.0.0
 faster-whisper==1.0.1
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.1.0+cpu

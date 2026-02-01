@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-ZalupAIBot - Telegram бот для расшифровки голосовых сообщений.
-Использует Vosk для бесплатного офлайн распознавания русской речи.
+ZalupAIBot - Telegram бот для расшифровки голосовых сообщений и озвучки текста.
+Использует Vosk для распознавания речи и Silero TTS для синтеза.
 """
 
 import os
 import json
 import asyncio
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+import torch
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
+from aiogram.types import FSInputFile
 from vosk import Model, KaldiRecognizer
 import subprocess
 
@@ -33,12 +36,18 @@ if not BOT_TOKEN:
 # Путь к модели Vosk
 MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "/app/model")
 
+# Настройки TTS
+TTS_SPEAKER = os.getenv("TTS_SPEAKER", "xenia")  # xenia, aidar, baya, kseniya, eugene
+TTS_SAMPLE_RATE = 48000
+
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Глобальная переменная для модели Vosk
+# Глобальные переменные для моделей
 vosk_model = None
+tts_model = None
+bot_info = None
 
 
 def load_vosk_model():
@@ -56,16 +65,75 @@ def load_vosk_model():
     return vosk_model
 
 
+def load_tts_model():
+    """Загрузка модели Silero TTS для синтеза речи."""
+    global tts_model
+    if tts_model is None:
+        logger.info("Загрузка модели Silero TTS...")
+        device = torch.device('cpu')
+        tts_model, _ = torch.hub.load(
+            repo_or_dir='snakers4/silero-models',
+            model='silero_tts',
+            language='ru',
+            speaker='v4_ru'
+        )
+        tts_model.to(device)
+        logger.info("Модель Silero TTS успешно загружена!")
+    return tts_model
+
+
+def text_to_speech(text: str, output_path: str) -> bool:
+    """Синтез речи из текста с помощью Silero TTS."""
+    try:
+        model = load_tts_model()
+
+        # Генерируем аудио
+        audio = model.apply_tts(
+            text=text,
+            speaker=TTS_SPEAKER,
+            sample_rate=TTS_SAMPLE_RATE
+        )
+
+        # Сохраняем как WAV
+        import torchaudio
+        torchaudio.save(output_path, audio.unsqueeze(0), TTS_SAMPLE_RATE)
+
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка синтеза речи: {e}")
+        return False
+
+
+def convert_wav_to_ogg(wav_path: str, ogg_path: str) -> bool:
+    """Конвертация WAV в OGG для отправки как голосовое сообщение."""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-i", wav_path,
+                "-acodec", "libopus",
+                "-b:a", "64k",
+                "-y",
+                ogg_path
+            ],
+            capture_output=True,
+            check=True
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Ошибка конвертации в OGG: {e.stderr.decode()}")
+        return False
+
+
 def convert_ogg_to_wav(ogg_path: str, wav_path: str) -> bool:
     """Конвертация OGG в WAV с помощью ffmpeg."""
     try:
         subprocess.run(
             [
                 "ffmpeg", "-i", ogg_path,
-                "-ar", "16000",  # Частота дискретизации 16kHz для Vosk
-                "-ac", "1",      # Моно
+                "-ar", "16000",
+                "-ac", "1",
                 "-f", "wav",
-                "-y",            # Перезаписать если существует
+                "-y",
                 wav_path
             ],
             capture_output=True,
@@ -86,7 +154,6 @@ def transcribe_audio(wav_path: str) -> str:
     result_text = []
 
     with open(wav_path, "rb") as audio_file:
-        # Пропускаем WAV заголовок
         audio_file.read(44)
 
         while True:
@@ -98,7 +165,6 @@ def transcribe_audio(wav_path: str) -> str:
                 if result.get("text"):
                     result_text.append(result["text"])
 
-        # Получаем финальный результат
         final_result = json.loads(recognizer.FinalResult())
         if final_result.get("text"):
             result_text.append(final_result["text"])
@@ -118,15 +184,62 @@ def format_user_name(user: types.User) -> str:
     return " ".join(parts) if parts else "Неизвестный"
 
 
+def is_bot_mentioned(message: types.Message, bot_username: str) -> bool:
+    """Проверка, упомянут ли бот в сообщении."""
+    if not message.text:
+        return False
+
+    text_lower = message.text.lower()
+
+    # Проверяем @username
+    if f"@{bot_username.lower()}" in text_lower:
+        return True
+
+    # Проверяем entities на mention
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "mention":
+                mention = message.text[entity.offset:entity.offset + entity.length]
+                if mention.lower() == f"@{bot_username.lower()}":
+                    return True
+
+    return False
+
+
+def extract_text_for_tts(message: types.Message, bot_username: str) -> str:
+    """Извлечение текста для озвучки (без упоминания бота)."""
+    text = message.text or ""
+
+    # Убираем упоминание бота
+    text = re.sub(rf'@{re.escape(bot_username)}\s*', '', text, flags=re.IGNORECASE)
+
+    return text.strip()
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     """Обработка команды /start."""
     await message.answer(
         "👋 Привет! Я ZalupAI Bot.\n\n"
-        "🎤 Я автоматически расшифровываю голосовые сообщения в текст.\n\n"
-        "Добавь меня в групповой чат и дай права на чтение сообщений - "
-        "я буду присылать текстовую расшифровку после каждого голосового сообщения."
+        "🎤 **Расшифровка голосовых:**\n"
+        "Я автоматически расшифровываю голосовые сообщения в текст.\n\n"
+        "🔊 **Озвучка текста:**\n"
+        "Перешли мне текстовое сообщение и упомяни меня (@) — я озвучу его голосом диктора.\n\n"
+        "Добавь меня в групповой чат (не забудь отключить Privacy Mode через @BotFather).",
+        parse_mode=ParseMode.MARKDOWN
     )
+
+
+@dp.message(Command("voice"))
+async def cmd_voice(message: types.Message):
+    """Команда для озвучки текста после команды."""
+    text = message.text.replace("/voice", "").strip()
+
+    if not text:
+        await message.reply("Напиши текст после команды: `/voice Привет, мир!`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    await synthesize_and_send(message, text)
 
 
 @dp.message(F.voice)
@@ -138,15 +251,12 @@ async def handle_voice(message: types.Message):
 
     logger.info(f"Получено голосовое сообщение от {user_name}")
 
-    # Отправляем уведомление о начале обработки
     processing_msg = await message.reply("🔄 Расшифровываю...")
 
     try:
-        # Скачиваем голосовое сообщение
         voice = message.voice
         file = await bot.get_file(voice.file_id)
 
-        # Создаем временные файлы
         with NamedTemporaryFile(suffix=".ogg", delete=False) as ogg_file:
             ogg_path = ogg_file.name
 
@@ -154,30 +264,24 @@ async def handle_voice(message: types.Message):
             wav_path = wav_file.name
 
         try:
-            # Скачиваем файл
             await bot.download_file(file.file_path, ogg_path)
 
-            # Конвертируем в WAV
             if not convert_ogg_to_wav(ogg_path, wav_path):
                 await processing_msg.edit_text("❌ Ошибка конвертации аудио")
                 return
 
-            # Распознаем речь
             text = transcribe_audio(wav_path)
 
             if not text:
                 text = "[не удалось распознать речь]"
 
-            # Формируем ответ
             response = f"🎙 **Голосовой эфир от пользователя ({user_name}) {timestamp}**\n\n{text}"
 
-            # Редактируем сообщение с результатом
             await processing_msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
 
             logger.info(f"Расшифровка завершена: {text[:50]}...")
 
         finally:
-            # Удаляем временные файлы
             for path in [ogg_path, wav_path]:
                 try:
                     os.unlink(path)
@@ -213,7 +317,6 @@ async def handle_video_note(message: types.Message):
         try:
             await bot.download_file(file.file_path, video_path)
 
-            # Извлекаем аудио из видео
             if not convert_ogg_to_wav(video_path, wav_path):
                 await processing_msg.edit_text("❌ Ошибка извлечения аудио")
                 return
@@ -239,12 +342,120 @@ async def handle_video_note(message: types.Message):
         await processing_msg.edit_text(f"❌ Ошибка: {str(e)}")
 
 
+async def synthesize_and_send(message: types.Message, text: str):
+    """Синтез и отправка голосового сообщения."""
+    if len(text) > 1000:
+        await message.reply("❌ Слишком длинный текст (максимум 1000 символов)")
+        return
+
+    if len(text) < 2:
+        await message.reply("❌ Слишком короткий текст")
+        return
+
+    processing_msg = await message.reply("🔊 Озвучиваю...")
+
+    try:
+        with NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
+            wav_path = wav_file.name
+
+        with NamedTemporaryFile(suffix=".ogg", delete=False) as ogg_file:
+            ogg_path = ogg_file.name
+
+        try:
+            # Синтезируем речь
+            if not text_to_speech(text, wav_path):
+                await processing_msg.edit_text("❌ Ошибка синтеза речи")
+                return
+
+            # Конвертируем в OGG для Telegram
+            if not convert_wav_to_ogg(wav_path, ogg_path):
+                await processing_msg.edit_text("❌ Ошибка конвертации аудио")
+                return
+
+            # Удаляем сообщение "Озвучиваю..."
+            await processing_msg.delete()
+
+            # Отправляем голосовое сообщение
+            voice_file = FSInputFile(ogg_path)
+            await message.reply_voice(voice_file, caption=f"🔊 {text[:100]}{'...' if len(text) > 100 else ''}")
+
+            logger.info(f"Озвучка завершена: {text[:50]}...")
+
+        finally:
+            for path in [wav_path, ogg_path]:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    except Exception as e:
+        logger.error(f"Ошибка озвучки: {e}")
+        await processing_msg.edit_text(f"❌ Ошибка: {str(e)}")
+
+
+@dp.message(F.forward_date & F.text)
+async def handle_forwarded_text(message: types.Message):
+    """Обработка пересланных текстовых сообщений с упоминанием бота."""
+    global bot_info
+
+    if not bot_info:
+        return
+
+    # Проверяем, упомянут ли бот
+    if not is_bot_mentioned(message, bot_info.username):
+        return
+
+    # Извлекаем текст для озвучки (текст пересланного сообщения)
+    # Если есть forward, берём текст сообщения без упоминания бота
+    text = extract_text_for_tts(message, bot_info.username)
+
+    if not text:
+        await message.reply("❌ Не нашёл текст для озвучки")
+        return
+
+    logger.info(f"Озвучка пересланного сообщения: {text[:50]}...")
+    await synthesize_and_send(message, text)
+
+
+@dp.message(F.text)
+async def handle_text_with_mention(message: types.Message):
+    """Обработка текстовых сообщений с упоминанием бота (reply на текст)."""
+    global bot_info
+
+    if not bot_info:
+        return
+
+    # Проверяем, упомянут ли бот
+    if not is_bot_mentioned(message, bot_info.username):
+        return
+
+    # Если это ответ на сообщение - озвучиваем то сообщение
+    if message.reply_to_message and message.reply_to_message.text:
+        text = message.reply_to_message.text
+        logger.info(f"Озвучка сообщения по reply: {text[:50]}...")
+        await synthesize_and_send(message, text)
+        return
+
+    # Иначе озвучиваем текст из самого сообщения (без упоминания бота)
+    text = extract_text_for_tts(message, bot_info.username)
+
+    if text:
+        await synthesize_and_send(message, text)
+
+
 async def main():
     """Главная функция запуска бота."""
+    global bot_info
+
     logger.info("Запуск ZalupAI Bot...")
 
-    # Предзагрузка модели при старте
+    # Получаем информацию о боте
+    bot_info = await bot.get_me()
+    logger.info(f"Бот: @{bot_info.username}")
+
+    # Предзагрузка моделей при старте
     load_vosk_model()
+    load_tts_model()
 
     logger.info("Бот запущен и готов к работе!")
     await dp.start_polling(bot)

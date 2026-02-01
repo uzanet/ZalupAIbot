@@ -6,6 +6,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
+    libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Копирование и установка Python зависимостей (только готовые бинарники)

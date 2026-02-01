@@ -6,20 +6,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
-    pkg-config \
-    build-essential \
-    libavformat-dev \
-    libavcodec-dev \
-    libavdevice-dev \
-    libavutil-dev \
-    libswscale-dev \
-    libswresample-dev \
-    libavfilter-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Копирование и установка Python зависимостей
+# Копирование и установка Python зависимостей (только готовые бинарники)
 COPY requirements.txt .
-RUN pip install --no-cache-dir --timeout=600 -r requirements.txt
+RUN pip install --no-cache-dir --timeout=600 --only-binary=av -r requirements.txt
 
 # Предзагрузка модели Whisper (small) при сборке
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"

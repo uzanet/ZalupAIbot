@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
 ZalupAIBot - Telegram бот для расшифровки голосовых сообщений и озвучки текста.
-Использует Vosk для распознавания речи и Silero TTS для синтеза.
+Использует Whisper для распознавания речи и Silero TTS для синтеза.
 """
 
 import os
-import json
 import asyncio
 import logging
 import re
 from datetime import datetime
-from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import torch
@@ -18,7 +16,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import FSInputFile
-from vosk import Model, KaldiRecognizer
+from faster_whisper import WhisperModel
 import subprocess
 
 # Настройка логирования
@@ -33,8 +31,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set!")
 
-# Путь к модели Vosk
-MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "/app/model")
+# Настройки Whisper
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # tiny, base, small, medium, large-v3
 
 # Настройки TTS
 TTS_SPEAKER = os.getenv("TTS_SPEAKER", "xenia")  # xenia, aidar, baya, kseniya, eugene
@@ -45,24 +43,23 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # Глобальные переменные для моделей
-vosk_model = None
+whisper_model = None
 tts_model = None
 bot_info = None
 
 
-def load_vosk_model():
-    """Загрузка модели Vosk для распознавания речи."""
-    global vosk_model
-    if vosk_model is None:
-        logger.info(f"Загрузка модели Vosk из {MODEL_PATH}...")
-        if not Path(MODEL_PATH).exists():
-            raise FileNotFoundError(
-                f"Модель Vosk не найдена по пути {MODEL_PATH}. "
-                "Скачайте русскую модель с https://alphacephei.com/vosk/models"
-            )
-        vosk_model = Model(MODEL_PATH)
-        logger.info("Модель Vosk успешно загружена!")
-    return vosk_model
+def load_whisper_model():
+    """Загрузка модели Whisper для распознавания речи."""
+    global whisper_model
+    if whisper_model is None:
+        logger.info(f"Загрузка модели Whisper ({WHISPER_MODEL})...")
+        whisper_model = WhisperModel(
+            WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8"  # Оптимизация для CPU
+        )
+        logger.info("Модель Whisper успешно загружена!")
+    return whisper_model
 
 
 def load_tts_model():
@@ -80,6 +77,26 @@ def load_tts_model():
         tts_model.to(device)
         logger.info("Модель Silero TTS успешно загружена!")
     return tts_model
+
+
+def transcribe_audio(audio_path: str) -> str:
+    """Распознавание речи из аудио файла с помощью Whisper."""
+    model = load_whisper_model()
+
+    segments, info = model.transcribe(
+        audio_path,
+        language="ru",
+        beam_size=5,
+        vad_filter=True,  # Фильтр тишины
+        vad_parameters=dict(min_silence_duration_ms=500)
+    )
+
+    # Собираем текст из всех сегментов
+    text_parts = []
+    for segment in segments:
+        text_parts.append(segment.text.strip())
+
+    return " ".join(text_parts).strip()
 
 
 def text_to_speech(text: str, output_path: str) -> bool:
@@ -122,54 +139,6 @@ def convert_wav_to_ogg(wav_path: str, ogg_path: str) -> bool:
     except subprocess.CalledProcessError as e:
         logger.error(f"Ошибка конвертации в OGG: {e.stderr.decode()}")
         return False
-
-
-def convert_ogg_to_wav(ogg_path: str, wav_path: str) -> bool:
-    """Конвертация OGG в WAV с помощью ffmpeg."""
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-i", ogg_path,
-                "-ar", "16000",
-                "-ac", "1",
-                "-f", "wav",
-                "-y",
-                wav_path
-            ],
-            capture_output=True,
-            check=True
-        )
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Ошибка конвертации: {e.stderr.decode()}")
-        return False
-
-
-def transcribe_audio(wav_path: str) -> str:
-    """Распознавание речи из WAV файла с помощью Vosk."""
-    model = load_vosk_model()
-    recognizer = KaldiRecognizer(model, 16000)
-    recognizer.SetWords(True)
-
-    result_text = []
-
-    with open(wav_path, "rb") as audio_file:
-        audio_file.read(44)
-
-        while True:
-            data = audio_file.read(4000)
-            if len(data) == 0:
-                break
-            if recognizer.AcceptWaveform(data):
-                result = json.loads(recognizer.Result())
-                if result.get("text"):
-                    result_text.append(result["text"])
-
-        final_result = json.loads(recognizer.FinalResult())
-        if final_result.get("text"):
-            result_text.append(final_result["text"])
-
-    return " ".join(result_text).strip()
 
 
 def format_user_name(user: types.User) -> str:
@@ -222,7 +191,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Привет! Я ZalupAI Bot.\n\n"
         "🎤 **Расшифровка голосовых:**\n"
-        "Я автоматически расшифровываю голосовые сообщения в текст.\n\n"
+        "Я автоматически расшифровываю голосовые сообщения в текст с пунктуацией.\n\n"
         "🔊 **Озвучка текста:**\n"
         "Перешли мне текстовое сообщение и упомяни меня (@) — я озвучу его голосом диктора.\n\n"
         "Добавь меня в групповой чат (не забудь отключить Privacy Mode через @BotFather).",
@@ -260,17 +229,11 @@ async def handle_voice(message: types.Message):
         with NamedTemporaryFile(suffix=".ogg", delete=False) as ogg_file:
             ogg_path = ogg_file.name
 
-        with NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
-            wav_path = wav_file.name
-
         try:
             await bot.download_file(file.file_path, ogg_path)
 
-            if not convert_ogg_to_wav(ogg_path, wav_path):
-                await processing_msg.edit_text("❌ Ошибка конвертации аудио")
-                return
-
-            text = transcribe_audio(wav_path)
+            # Whisper работает напрямую с OGG
+            text = transcribe_audio(ogg_path)
 
             if not text:
                 text = "[не удалось распознать речь]"
@@ -282,11 +245,10 @@ async def handle_voice(message: types.Message):
             logger.info(f"Расшифровка завершена: {text[:50]}...")
 
         finally:
-            for path in [ogg_path, wav_path]:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            try:
+                os.unlink(ogg_path)
+            except OSError:
+                pass
 
     except Exception as e:
         logger.error(f"Ошибка обработки голосового сообщения: {e}")
@@ -311,17 +273,11 @@ async def handle_video_note(message: types.Message):
         with NamedTemporaryFile(suffix=".mp4", delete=False) as video_file:
             video_path = video_file.name
 
-        with NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
-            wav_path = wav_file.name
-
         try:
             await bot.download_file(file.file_path, video_path)
 
-            if not convert_ogg_to_wav(video_path, wav_path):
-                await processing_msg.edit_text("❌ Ошибка извлечения аудио")
-                return
-
-            text = transcribe_audio(wav_path)
+            # Whisper работает напрямую с MP4
+            text = transcribe_audio(video_path)
 
             if not text:
                 text = "[не удалось распознать речь]"
@@ -331,11 +287,10 @@ async def handle_video_note(message: types.Message):
             await processing_msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
 
         finally:
-            for path in [video_path, wav_path]:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            try:
+                os.unlink(video_path)
+            except OSError:
+                pass
 
     except Exception as e:
         logger.error(f"Ошибка обработки видеосообщения: {e}")
@@ -406,7 +361,6 @@ async def handle_forwarded_text(message: types.Message):
         return
 
     # Извлекаем текст для озвучки (текст пересланного сообщения)
-    # Если есть forward, берём текст сообщения без упоминания бота
     text = extract_text_for_tts(message, bot_info.username)
 
     if not text:
@@ -454,7 +408,7 @@ async def main():
     logger.info(f"Бот: @{bot_info.username}")
 
     # Предзагрузка моделей при старте
-    load_vosk_model()
+    load_whisper_model()
     load_tts_model()
 
     logger.info("Бот запущен и готов к работе!")

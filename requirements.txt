@@ -1,5 +1,7 @@
 aiogram==3.4.1
 faster-whisper>=1.1.0
+omegaconf
+numpy<2
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.1.0+cpu
 torchaudio==2.1.0+cpu

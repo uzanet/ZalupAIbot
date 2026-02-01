@@ -16,9 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavfilter-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Копирование и установка Python зависимостей
+# Копирование и установка Python зависимостей (с увеличенным таймаутом)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout=300 -r requirements.txt
 
 # Предзагрузка модели Whisper (small) при сборке
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"

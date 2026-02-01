@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  zalupaibot:
+    build: .
+    container_name: zalupaibot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - VOSK_MODEL_PATH=/app/model
+    # Опционально: подключить внешнюю модель для лучшего качества
+    # volumes:
+    #   - ./vosk-model-ru-0.42:/app/model:ro

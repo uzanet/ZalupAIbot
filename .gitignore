@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# Vosk models (too large for git)
+vosk-model-*/
+model/
+
+# Temp files
+*.ogg
+*.wav
+*.mp4
+
+# IDE
+.idea/
+.vscode/
+*.swp
